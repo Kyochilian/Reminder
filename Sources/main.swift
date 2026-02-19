@@ -1577,7 +1577,7 @@ struct SettingsView: View {
             }
             
             Section {
-                 Text("Reminder v0.1.0")
+                 Text("Reminder v0.1.1")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .center)

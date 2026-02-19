@@ -4,7 +4,7 @@ set -euo pipefail
 
 APP_NAME="Reminder"
 BUNDLE_ID="${BUNDLE_ID:-com.phantasma.Reminder}"
-APP_VERSION="${APP_VERSION:-0.1.0}"
+APP_VERSION="${APP_VERSION:-0.1.1}"
 APP_BUILD="${APP_BUILD:-1}"
 MIN_SYSTEM="${MIN_SYSTEM:-13.0}"
 OUTPUT_DIR="${1:-dist}"

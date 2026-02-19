@@ -76,5 +76,21 @@ swift test
 可选自定义参数：
 
 ```bash
-BUNDLE_ID=com.yourcompany.Reminder APP_VERSION=0.1.0 APP_BUILD=42 ./scripts/package_app.sh
+BUNDLE_ID=com.yourcompany.Reminder APP_VERSION=0.1.1 APP_BUILD=42 ./scripts/package_app.sh
+```
+
+## 打包为 .dmg（可下载安装）
+
+```bash
+./scripts/package_dmg.sh
+```
+
+默认产物：
+
+- `dist/Reminder-v0.1.1-macOS.dmg`
+
+可选自定义参数：
+
+```bash
+APP_VERSION=0.1.1 APP_BUILD=2 ./scripts/package_dmg.sh
 ```
