@@ -1,4 +1,5 @@
 import AppKit
+import CoreText
 import SwiftUI
 import UserNotifications
 
@@ -28,6 +29,92 @@ private enum WindowDefaults {
 enum SessionPhase: String {
     case working
     case resting
+}
+
+enum AppLanguage: String, CaseIterable, Identifiable {
+    case zhHans = "zh-Hans"
+    case en = "en"
+
+    var id: String { rawValue }
+
+    static var preferredDefault: AppLanguage {
+        let preferred = Locale.preferredLanguages.first ?? ""
+        return preferred.hasPrefix("zh") ? .zhHans : .en
+    }
+}
+
+@MainActor
+private enum FontAwesomeSupport {
+    private static let candidateFontNames = [
+        "Font Awesome 6 Free Solid",
+        "Font Awesome 6 Free-Regular-400",
+        "Font Awesome 6 Free",
+        "FontAwesome"
+    ]
+    private static var didAttemptRegister = false
+    private static var cachedFontName: String?
+
+    static func resolvedFontName() -> String? {
+        if let cachedFontName {
+            return cachedFontName
+        }
+        registerIfNeeded()
+        for name in candidateFontNames where NSFont(name: name, size: 14) != nil {
+            cachedFontName = name
+            return name
+        }
+        return nil
+    }
+
+    private static func registerIfNeeded() {
+        guard !didAttemptRegister else { return }
+        didAttemptRegister = true
+
+        let cwdAssetURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("assets/fa-solid-900.ttf")
+
+        let candidateURLs: [URL] = [
+            Bundle.main.url(forResource: "fa-solid-900", withExtension: "ttf"),
+            Bundle.main.url(forResource: "FontAwesomeSolid", withExtension: "ttf"),
+            cwdAssetURL
+        ].compactMap { $0 }
+
+        for url in candidateURLs where FileManager.default.fileExists(atPath: url.path) {
+            CTFontManagerRegisterFontsForURL(url as CFURL, .process, nil)
+        }
+    }
+}
+
+private struct FontAwesomeSymbolView: View {
+    let unicode: String
+    let fallbackSystemName: String
+    let size: CGFloat
+    let color: Color
+
+    init(
+        unicode: String,
+        fallbackSystemName: String,
+        size: CGFloat = 18,
+        color: Color = .primary
+    ) {
+        self.unicode = unicode
+        self.fallbackSystemName = fallbackSystemName
+        self.size = size
+        self.color = color
+    }
+
+    var body: some View {
+        Group {
+            if let fontName = FontAwesomeSupport.resolvedFontName() {
+                Text(unicode)
+                    .font(.custom(fontName, size: size))
+            } else {
+                Image(systemName: fallbackSystemName)
+                    .font(.system(size: size, weight: .semibold))
+            }
+        }
+        .foregroundStyle(color)
+    }
 }
 
 private enum NotificationBackend {
@@ -77,6 +164,7 @@ private enum DefaultsKey {
     static let workMaxMinutes = "workMaxMinutes"
     static let breakMinMinutes = "breakMinMinutes"
     static let breakMaxMinutes = "breakMaxMinutes"
+    static let appLanguage = "appLanguage"
     static let allowExitFullscreenDuringBreak = "allowExitFullscreenDuringBreak"
     static let phase = "phase"
     static let remainingWorkSeconds = "remainingWorkSeconds"
@@ -85,6 +173,7 @@ private enum DefaultsKey {
     static let breakEndDate = "breakEndDate"
     static let remindersSent = "remindersSent"
     static let notificationAuthorizationRequested = "notificationAuthorizationRequested"
+    static let notificationEnableHintShown = "notificationEnableHintShown"
     static let hasStartedTimer = "hasStartedTimer"
 }
 
@@ -111,12 +200,14 @@ final class ReminderEngine: ObservableObject {
     @Published private(set) var remindersSent = 0
     @Published private(set) var isScreenLocked = false
     @Published private(set) var isFullscreenReminderVisible = false
-    @Published private(set) var notificationStatusText = "通知权限检查中"
+    @Published private(set) var notificationStatusText = "Checking notification permission..."
     @Published private(set) var hasStartedTimer = false
     @Published private(set) var isTickerRunning = false
     @Published var enableFullscreenBlur = true
     @Published var enableRestAnimation = true
     @Published private(set) var allowExitFullscreenDuringBreak = true
+    @Published private(set) var appLanguage: AppLanguage = .zhHans
+    @Published private(set) var shouldShowNotificationEnableHint = false
 
     private let defaults: UserDefaults
     private let now: () -> Date
@@ -168,13 +259,33 @@ final class ReminderEngine: ObservableObject {
 
         switch notificationBackend {
         case .userNotifications:
+            if !defaults.bool(forKey: DefaultsKey.notificationEnableHintShown) {
+                shouldShowNotificationEnableHint = true
+            }
             requestNotificationAuthorizationOnFirstLaunchIfNeeded()
             refreshNotificationStatus()
         case .legacyNSUserNotifications:
-            notificationStatusText = "通知已开启（开发模式）"
+            notificationStatusText = tr("通知已开启（开发模式）", "Notifications enabled (development mode)")
         case .disabledForTests:
-            notificationStatusText = "通知已开启（测试模式）"
+            notificationStatusText = tr("通知已开启（测试模式）", "Notifications enabled (test mode)")
         }
+    }
+
+    func dismissNotificationEnableHint() {
+        guard shouldShowNotificationEnableHint else { return }
+        shouldShowNotificationEnableHint = false
+        defaults.set(true, forKey: DefaultsKey.notificationEnableHintShown)
+    }
+
+    func tr(_ zh: String, _ en: String) -> String {
+        appLanguage == .zhHans ? zh : en
+    }
+
+    func setLanguage(_ language: AppLanguage) {
+        guard appLanguage != language else { return }
+        appLanguage = language
+        refreshNotificationStatus()
+        saveState()
     }
 
     var usesUserNotifications: Bool {
@@ -201,55 +312,67 @@ final class ReminderEngine: ObservableObject {
 
     var modeTitle: String {
         if needsManualStart {
-            return "等待开始计时"
+            return tr("等待开始计时", "Ready to Start")
         }
         switch phase {
         case .resting:
-            return "休息中"
+            return tr("休息中", "On Break")
         case .working:
             if waitingForRestConfirmation {
-                return "等待确认休息"
+                return tr("等待确认休息", "Awaiting Break Confirmation")
             }
-            return isScreenLocked ? "工作中（锁屏暂停）" : "工作中"
+            return isScreenLocked
+                ? tr("工作中（锁屏暂停）", "Working (Paused While Screen Locked)")
+                : tr("工作中", "Working")
         }
     }
 
     var statusLine: String {
         if needsManualStart {
-            return "首次打开应用请点击“开始计时”。"
+            return tr(
+                "首次打开应用请点击“开始计时”。",
+                "Please click “Start Timer” the first time you open the app."
+            )
         }
         switch phase {
         case .resting:
-            return isScreenLocked ? "锁屏时休息计时继续。" : "请看向远处，放松眼部肌肉。"
+            return isScreenLocked
+                ? tr("锁屏时休息计时继续。", "Break countdown continues while screen is locked.")
+                : tr("请看向远处，放松眼部肌肉。", "Look into the distance to relax your eye muscles.")
         case .working:
             if waitingForRestConfirmation {
-                return "若未点击“确定休息”，将每 5 分钟再次提醒。"
+                return tr(
+                    "若未点击“确定休息”，将每 5 分钟再次提醒。",
+                    "If not confirmed, a reminder repeats every 5 minutes."
+                )
             }
-            return isScreenLocked ? "屏幕已锁定，工作计时暂停。" : "专注工作中。"
+            return isScreenLocked
+                ? tr("屏幕已锁定，工作计时暂停。", "Screen is locked, work timer is paused.")
+                : tr("专注工作中。", "Stay focused.")
         }
     }
 
     var countdownLine: String {
         if needsManualStart {
-            return "准备时长 \(Self.format(seconds: remainingWorkSeconds))"
+            return tr("准备时长 ", "Ready duration ") + Self.format(seconds: remainingWorkSeconds)
         }
         switch phase {
         case .resting:
-            return "休息剩余 \(Self.format(seconds: remainingBreakSeconds))"
+            return tr("休息剩余 ", "Break remaining ") + Self.format(seconds: remainingBreakSeconds)
         case .working:
             if waitingForRestConfirmation {
-                return "下次提醒倒计时 \(Self.format(seconds: secondsUntilNextReminder))"
+                return tr("下次提醒倒计时 ", "Next reminder in ") + Self.format(seconds: secondsUntilNextReminder)
             }
-            return "距离提醒 \(Self.format(seconds: remainingWorkSeconds))"
+            return tr("距离提醒 ", "Reminder in ") + Self.format(seconds: remainingWorkSeconds)
         }
     }
 
     var workIntervalDescription: String {
-        Self.formatMinutes(workIntervalMinutes)
+        formatMinutes(workIntervalMinutes)
     }
 
     var breakDurationDescription: String {
-        Self.formatMinutes(breakDurationMinutes)
+        formatMinutes(breakDurationMinutes)
     }
 
     var breakCountdownText: String {
@@ -359,7 +482,15 @@ final class ReminderEngine: ObservableObject {
         saveState()
     }
 
+    func showFullscreenBreakCountdownIfResting() {
+        guard phase == .resting else { return }
+        isFullscreenReminderVisible = true
+        showFullscreenBreakCountdown?()
+        saveState()
+    }
+
     func skipRest() {
+        guard allowExitFullscreenDuringBreak else { return }
         guard phase == .resting else { return }
         finishRestCycle()
     }
@@ -371,12 +502,12 @@ final class ReminderEngine: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 let status = await NotificationBridge.authorizationStatus()
-                self.notificationStatusText = Self.notificationStatusText(from: status)
+                self.notificationStatusText = self.notificationStatusText(from: status)
             }
         case .legacyNSUserNotifications:
-            notificationStatusText = "通知已开启（开发模式）"
+            notificationStatusText = tr("通知已开启（开发模式）", "Notifications enabled (development mode)")
         case .disabledForTests:
-            notificationStatusText = "通知已开启（测试模式）"
+            notificationStatusText = tr("通知已开启（测试模式）", "Notifications enabled (test mode)")
         }
     }
 
@@ -517,7 +648,10 @@ final class ReminderEngine: ObservableObject {
             do {
                 try await NotificationBridge.requestAuthorization()
             } catch {
-                self.notificationStatusText = "通知授权失败：\(error.localizedDescription)"
+                self.notificationStatusText = self.tr(
+                    "通知授权失败：\(error.localizedDescription)",
+                    "Notification authorization failed: \(error.localizedDescription)"
+                )
             }
             self.refreshNotificationStatus()
         }
@@ -527,9 +661,24 @@ final class ReminderEngine: ObservableObject {
         guard isActivated else { return }
         switch notificationBackend {
         case .userNotifications:
+            let confirmRestAction = UNNotificationAction(
+                identifier: confirmRestActionID,
+                title: tr("确定休息", "Start Break"),
+                options: [.foreground]
+            )
+            let category = UNNotificationCategory(
+                identifier: reminderCategoryID,
+                actions: [confirmRestAction],
+                intentIdentifiers: []
+            )
+            UNUserNotificationCenter.current().setNotificationCategories([category])
+
             let content = UNMutableNotificationContent()
-            content.title = "该休息眼睛了"
-            content.body = "点击“确定休息”开始休息计时。"
+            content.title = tr("该休息眼睛了", "Time to Rest Your Eyes")
+            content.body = tr(
+                "点击“确定休息”开始休息计时。",
+                "Tap “Start Break” to begin the rest countdown."
+            )
             content.sound = .default
             content.categoryIdentifier = reminderCategoryID
 
@@ -544,16 +693,22 @@ final class ReminderEngine: ObservableObject {
                 do {
                     try await NotificationBridge.add(request)
                 } catch {
-                    self.notificationStatusText = "通知发送失败：\(error.localizedDescription)"
+                    self.notificationStatusText = self.tr(
+                        "通知发送失败：\(error.localizedDescription)",
+                        "Failed to send notification: \(error.localizedDescription)"
+                    )
                 }
             }
         case .legacyNSUserNotifications:
             let notification = NSUserNotification()
             notification.identifier = legacyReminderNotificationID
-            notification.title = "该休息眼睛了"
-            notification.informativeText = "点击“确定休息”开始休息计时。"
+            notification.title = tr("该休息眼睛了", "Time to Rest Your Eyes")
+            notification.informativeText = tr(
+                "点击“确定休息”开始休息计时。",
+                "Click “Start Break” to begin the rest countdown."
+            )
             notification.hasActionButton = true
-            notification.actionButtonTitle = "确定休息"
+            notification.actionButtonTitle = tr("确定休息", "Start Break")
             NSUserNotificationCenter.default.deliver(notification)
         case .disabledForTests:
             break
@@ -583,6 +738,14 @@ final class ReminderEngine: ObservableObject {
     }
 
     private func loadState() {
+        if let rawLanguage = defaults.string(forKey: DefaultsKey.appLanguage),
+           let parsedLanguage = AppLanguage(rawValue: rawLanguage) {
+            appLanguage = parsedLanguage
+        } else {
+            appLanguage = AppLanguage.preferredDefault
+        }
+        notificationStatusText = tr("通知权限检查中", "Checking notification permission...")
+
         if defaults.object(forKey: DefaultsKey.workMinMinutes) != nil ||
             defaults.object(forKey: DefaultsKey.workMaxMinutes) != nil {
             let loadedMin = defaults.object(forKey: DefaultsKey.workMinMinutes) != nil
@@ -694,6 +857,7 @@ final class ReminderEngine: ObservableObject {
         defaults.set(workMaxMinutes, forKey: DefaultsKey.workMaxMinutes)
         defaults.set(breakMinMinutes, forKey: DefaultsKey.breakMinMinutes)
         defaults.set(breakMaxMinutes, forKey: DefaultsKey.breakMaxMinutes)
+        defaults.set(appLanguage.rawValue, forKey: DefaultsKey.appLanguage)
         defaults.set(allowExitFullscreenDuringBreak, forKey: DefaultsKey.allowExitFullscreenDuringBreak)
         defaults.set(phase.rawValue, forKey: DefaultsKey.phase)
         defaults.set(remainingWorkSeconds, forKey: DefaultsKey.remainingWorkSeconds)
@@ -727,23 +891,26 @@ final class ReminderEngine: ObservableObject {
         return String(format: "%02d:%02d", minutes, second)
     }
 
-    private static func formatMinutes(_ value: Double) -> String {
+    private func formatMinutes(_ value: Double) -> String {
         if abs(value.rounded() - value) < 0.01 {
-            return "\(Int(value.rounded())) 分钟"
+            let rounded = Int(value.rounded())
+            return appLanguage == .zhHans ? "\(rounded) 分钟" : "\(rounded) min"
         }
-        return String(format: "%.1f 分钟", value)
+        return appLanguage == .zhHans
+            ? String(format: "%.1f 分钟", value)
+            : String(format: "%.1f min", value)
     }
 
-    private static func notificationStatusText(from status: UNAuthorizationStatus) -> String {
+    private func notificationStatusText(from status: UNAuthorizationStatus) -> String {
         switch status {
         case .authorized, .provisional, .ephemeral:
-            return "通知已开启"
+            return tr("通知已开启", "Notifications enabled")
         case .denied:
-            return "通知被关闭，请在系统设置中开启"
+            return tr("通知被关闭，请在系统设置中开启", "Notifications disabled. Enable them in System Settings.")
         case .notDetermined:
-            return "通知权限未确认"
+            return tr("通知权限未确认", "Notification permission not determined")
         @unknown default:
-            return "通知状态未知"
+            return tr("通知状态未知", "Unknown notification status")
         }
     }
 }
@@ -868,6 +1035,7 @@ struct CircularClockView: View {
 
 
 private struct FullscreenReminderPromptView: View {
+    @ObservedObject var engine: ReminderEngine
     let onStartBreak: () -> Void
     let onLater: () -> Void
 
@@ -880,16 +1048,30 @@ private struct FullscreenReminderPromptView: View {
             )
             .ignoresSafeArea()
 
-            VStack(spacing: 24) {
-                Text("该休息眼睛了")
+            VStack(spacing: 22) {
+                HStack(spacing: 10) {
+                    FontAwesomeSymbolView(
+                        unicode: "\u{f06e}",
+                        fallbackSystemName: "eye.fill",
+                        size: 28,
+                        color: .white
+                    )
+                    Text("👀")
+                        .font(.system(size: 30))
+                }
+
+                Text(engine.tr("该休息眼睛了", "Time to Rest Your Eyes"))
                     .font(.system(size: 54, weight: .bold))
                     .foregroundStyle(.white)
 
                 VStack(spacing: 8) {
-                    Text("20-20-20 法则")
+                    Text("20-20-20")
                         .font(.title2.weight(.semibold))
                         .foregroundStyle(.white.opacity(0.9))
-                    Text("建议每工作 20 分钟，眺望 20 英尺（6 米）外至少 20 秒")
+                    Text(engine.tr(
+                        "建议每工作 20 分钟，眺望 20 英尺（6 米）外至少 20 秒",
+                        "Every 20 minutes, look 20 feet away for at least 20 seconds"
+                    ))
                         .font(.body)
                         .foregroundStyle(.white.opacity(0.7))
                         .multilineTextAlignment(.center)
@@ -897,13 +1079,13 @@ private struct FullscreenReminderPromptView: View {
                 .padding(.horizontal, 24)
 
                 HStack(spacing: 16) {
-                    Button("稍后（5 分钟）") {
+                    Button(engine.tr("稍后（5 分钟）", "Later (5 min)")) {
                         onLater()
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.large)
 
-                    Button("开始休息") {
+                    Button(engine.tr("开始休息", "Start Break")) {
                         onStartBreak()
                     }
                     .buttonStyle(.borderedProminent)
@@ -930,27 +1112,30 @@ private struct FullscreenBreakCountdownView: View {
             .ignoresSafeArea()
 
             VStack(spacing: 18) {
-                Text("休息中")
+                Text(engine.tr("休息中", "On Break"))
                     .font(.system(size: 56, weight: .bold))
                     .foregroundStyle(.white)
                 Text(engine.breakCountdownText)
                     .font(.system(size: 96, weight: .semibold, design: .monospaced))
                     .foregroundStyle(.white)
-                Text("休息结束后会自动开始下一轮工作计时")
+                Text(engine.tr(
+                    "休息结束后会自动开始下一轮工作计时",
+                    "A new work cycle starts automatically after this break"
+                ))
                     .font(.title3)
                     .foregroundStyle(.white.opacity(0.8))
 
                 HStack(spacing: 16) {
-                    Button("跳过休息") {
-                        engine.skipRest()
-                        onExitFullscreen()
-                    }
-                    .buttonStyle(.bordered)
-                    .tint(.white.opacity(0.6))
-                    .controlSize(.large)
-
                     if engine.allowExitFullscreenDuringBreak {
-                        Button("退出全屏") {
+                        Button(engine.tr("跳过休息", "Skip Break")) {
+                            engine.skipRest()
+                            onExitFullscreen()
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(.white.opacity(0.6))
+                        .controlSize(.large)
+
+                        Button(engine.tr("退出全屏", "Exit Fullscreen")) {
                             onExitFullscreen()
                         }
                         .buttonStyle(.bordered)
@@ -974,9 +1159,11 @@ final class FullscreenReminderManager {
     }
 
     func showPrompt(onStartBreak: @escaping () -> Void, onLater: @escaping () -> Void) {
+        guard let engine else { return }
         let window = ensureWindow()
         window.contentViewController = NSHostingController(
             rootView: FullscreenReminderPromptView(
+                engine: engine,
                 onStartBreak: onStartBreak,
                 onLater: onLater
             )
@@ -1080,7 +1267,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
             let confirmRestAction = UNNotificationAction(
                 identifier: confirmRestActionID,
-                title: "确定休息",
+                title: engine.tr("确定休息", "Start Break"),
                 options: [.foreground]
             )
 
@@ -1399,6 +1586,10 @@ struct WheelTimePicker: View {
 
 struct SettingsView: View {
     @ObservedObject var reminderEngine: ReminderEngine
+
+    private func tr(_ zh: String, _ en: String) -> String {
+        reminderEngine.tr(zh, en)
+    }
     
     private var workIntervalBinding: Binding<Double> {
         Binding(
@@ -1510,19 +1701,26 @@ struct SettingsView: View {
             set: { reminderEngine.setAllowExitFullscreenDuringBreak($0) }
         )
     }
+
+    private var languageBinding: Binding<AppLanguage> {
+        Binding(
+            get: { reminderEngine.appLanguage },
+            set: { reminderEngine.setLanguage($0) }
+        )
+    }
     
     var body: some View {
         Form {
-            Section(header: Text("时间设置").font(.headline)) {
+            Section(header: Text(tr("时间设置", "Time Settings")).font(.headline)) {
                 HStack(alignment: .top, spacing: 16) {
                     timeSettingCard(
-                        title: "工作时长",
+                        title: tr("工作时长", "Work Duration"),
                         binding: workIntervalBinding,
                         range: reminderEngine.workMinMinutes...reminderEngine.workMaxMinutes,
                         color: .blue
                     )
                     timeSettingCard(
-                        title: "休息时长",
+                        title: tr("休息时长", "Break Duration"),
                         binding: breakDurationBinding,
                         range: reminderEngine.breakMinMinutes...reminderEngine.breakMaxMinutes,
                         color: .green
@@ -1532,15 +1730,15 @@ struct SettingsView: View {
                 .padding(.vertical, 8)
             }
 
-            Section("键入时间") {
-                LabeledContent("工作时长") {
+            Section(tr("键入时间", "Manual Input")) {
+                LabeledContent(tr("工作时长", "Work Duration")) {
                     durationInputRow(
                         minutes: workMinutesInput,
                         seconds: workSecondsInput,
                         tint: .blue
                     )
                 }
-                LabeledContent("休息时长") {
+                LabeledContent(tr("休息时长", "Break Duration")) {
                     durationInputRow(
                         minutes: breakMinutesInput,
                         seconds: breakSecondsInput,
@@ -1549,39 +1747,52 @@ struct SettingsView: View {
                 }
             }
 
-            Section("时长范围") {
-                LabeledContent("工作范围") {
+            Section(tr("时长范围", "Duration Range")) {
+                LabeledContent(tr("工作范围", "Work Range")) {
                     rangeInputRow(minutesMin: workMinInput, minutesMax: workMaxInput, tint: .blue)
                 }
-                LabeledContent("休息范围") {
+                LabeledContent(tr("休息范围", "Break Range")) {
                     rangeInputRow(minutesMin: breakMinInput, minutesMax: breakMaxInput, tint: .green)
                 }
-                Text("可手动输入最短/最长分钟数；轮盘和输入会按该范围自动约束。")
+                Text(
+                    tr(
+                        "可手动输入最短/最长分钟数；轮盘和输入会按该范围自动约束。",
+                        "You can type min/max minutes manually; wheel/input values are constrained automatically."
+                    )
+                )
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
-            Section("全屏休息倒计时") {
-                Toggle("允许在倒计时中退出全屏", isOn: allowExitFullscreenBreakBinding)
-                Text("关闭后，休息倒计时期间不显示“退出全屏”按钮。")
+            Section(tr("休息全屏策略", "Break Fullscreen Policy")) {
+                Toggle(
+                    tr("允许在倒计时中退出全屏", "Allow Exit Fullscreen During Break"),
+                    isOn: allowExitFullscreenBreakBinding
+                )
+                Text(
+                    tr(
+                        "关闭后，休息倒计时期间不显示“退出全屏”和“跳过休息”按钮。",
+                        "When disabled, both “Exit Fullscreen” and “Skip Break” are hidden during break countdown."
+                    )
+                )
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            
-            Section(header: Text("通知状态")) {
-                HStack {
-                    Text(reminderEngine.notificationStatusText)
-                        .foregroundStyle(.secondary)
-                    Spacer()
+
+            Section(tr("语言", "Language")) {
+                Picker("", selection: languageBinding) {
+                    Text("中文").tag(AppLanguage.zhHans)
+                    Text("English").tag(AppLanguage.en)
                 }
+                .pickerStyle(.segmented)
             }
             
             Section {
-                 Text("Reminder v0.1.1")
+                Text("Reminder v0.1.2")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .center)
-                 Text("Designed by KyochiLian with ❤️")
+                Text("Designed by KyochiLian with ❤️")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .center)
@@ -1625,13 +1836,13 @@ struct SettingsView: View {
         tint: Color
     ) -> some View {
         HStack(spacing: 8) {
-            TextField("分钟", value: minutes, format: .number)
+            TextField(tr("分钟", "Min"), value: minutes, format: .number)
                 .frame(width: 70)
             Stepper("", value: minutes, in: 0...1_440)
                 .labelsHidden()
             Text(":")
                 .foregroundStyle(.secondary)
-            TextField("秒", value: seconds, format: .number)
+            TextField(tr("秒", "Sec"), value: seconds, format: .number)
                 .frame(width: 56)
             Stepper("", value: seconds, in: 0...59)
                 .labelsHidden()
@@ -1647,19 +1858,19 @@ struct SettingsView: View {
         tint: Color
     ) -> some View {
         HStack(spacing: 8) {
-            Text("最短")
+            Text(tr("最短", "Min"))
                 .foregroundStyle(.secondary)
             TextField("0", value: minutesMin, format: .number)
                 .frame(width: 62)
             Stepper("", value: minutesMin, in: 0...1_440)
                 .labelsHidden()
-            Text("最长")
+            Text(tr("最长", "Max"))
                 .foregroundStyle(.secondary)
             TextField("120", value: minutesMax, format: .number)
                 .frame(width: 62)
             Stepper("", value: minutesMax, in: 0...1_440)
                 .labelsHidden()
-            Text("分钟")
+            Text(tr("分钟", "min"))
                 .foregroundStyle(.secondary)
         }
         .textFieldStyle(.roundedBorder)
@@ -1670,97 +1881,117 @@ struct SettingsView: View {
 
 struct TimerView: View {
     @ObservedObject var reminderEngine: ReminderEngine
+
+    private func tr(_ zh: String, _ en: String) -> String {
+        reminderEngine.tr(zh, en)
+    }
     
     var body: some View {
-        VStack(spacing: 30) {
-            Spacer()
-            
-            // Status Circle/Ring
-            ZStack {
-                Circle()
-                    .stroke(Color.secondary.opacity(0.1), lineWidth: 20)
-                
-                Circle() // Animated ring
-                    .trim(from: 0, to: statusProgress)
-                    .stroke(
-                        AngularGradient(
-                            gradient: Gradient(colors: [statusColor.opacity(0.6), statusColor]),
-                            center: .center,
-                            startAngle: .degrees(-90),
-                            endAngle: .degrees(-90 + 360 * statusProgress)
-                        ),
-                        style: StrokeStyle(lineWidth: 20, lineCap: .round)
-                    )
-                    .rotationEffect(.degrees(-90))
-                    .animation(.linear(duration: 1), value: statusProgress)
-                
-                VStack(spacing: 10) {
-                    Text(reminderEngine.modeTitle)
-                        .font(.title)
-                        .fontWeight(.medium)
-                        .multilineTextAlignment(.center)
-                    
-                    Text(reminderEngine.countdownLine)
-                        .font(.system(size: 24, weight: .bold, design: .monospaced))
-                        .minimumScaleFactor(0.5)
-                        .lineLimit(1)
-                }
-                .padding()
-            }
-            .frame(maxWidth: 300, maxHeight: 300)
-            .aspectRatio(1, contentMode: .fit)
-            .padding()
-            
-            Text(reminderEngine.statusLine)
-                .font(.body)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal)
-            
-            if reminderEngine.needsManualStart {
-                VStack(spacing: 10) {
-                    Button(action: { reminderEngine.startTiming() }) {
-                        Text("开始计时")
-                            .font(.headline)
-                            .frame(maxWidth: 240)
-                            .padding(.vertical, 8)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
+        ScrollView {
+            VStack(spacing: 22) {
+                ZStack {
+                    Circle()
+                        .stroke(Color.secondary.opacity(0.12), lineWidth: 20)
 
-                    Text("首次启动需手动点击开始，之后会自动恢复计时。")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
+                    Circle()
+                        .trim(from: 0, to: statusProgress)
+                        .stroke(
+                            AngularGradient(
+                                gradient: Gradient(colors: [statusColor.opacity(0.6), statusColor]),
+                                center: .center,
+                                startAngle: .degrees(-90),
+                                endAngle: .degrees(-90 + 360 * statusProgress)
+                            ),
+                            style: StrokeStyle(lineWidth: 20, lineCap: .round)
+                        )
+                        .rotationEffect(.degrees(-90))
+                        .animation(.linear(duration: 1), value: statusProgress)
+
+                    VStack(spacing: 10) {
+                        Text(reminderEngine.modeTitle)
+                            .font(.title2.weight(.semibold))
+                            .multilineTextAlignment(.center)
+
+                        Text(reminderEngine.countdownLine)
+                            .font(.system(size: 26, weight: .bold, design: .monospaced))
+                            .minimumScaleFactor(0.5)
+                            .lineLimit(1)
+                    }
+                    .padding()
                 }
-            } else {
-                HStack(spacing: 12) {
-                    if reminderEngine.phase == .resting {
-                        Button(action: { reminderEngine.skipRest() }) {
-                            Text("跳过休息")
+                .frame(maxWidth: 260, maxHeight: 260)
+                .aspectRatio(1, contentMode: .fit)
+                .padding(.top, 8)
+
+                Text(reminderEngine.statusLine)
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+
+                if reminderEngine.needsManualStart {
+                    VStack(spacing: 10) {
+                        Button(action: { reminderEngine.startTiming() }) {
+                            Text(tr("开始计时", "Start Timer"))
                                 .font(.headline)
-                                .frame(maxWidth: 150)
+                                .frame(maxWidth: 260)
                                 .padding(.vertical, 8)
                         }
-                        .buttonStyle(.bordered)
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.large)
+
+                        Text(tr(
+                            "首次启动需手动点击开始，之后会自动恢复计时。",
+                            "Click once to start. Timer will auto-resume on next launches."
+                        ))
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                } else if reminderEngine.phase == .resting {
+                    HStack(spacing: 12) {
+                        if reminderEngine.allowExitFullscreenDuringBreak {
+                            Button(action: { reminderEngine.skipRest() }) {
+                                Text(tr("跳过休息", "Skip Break"))
+                                    .font(.headline)
+                                    .frame(maxWidth: 170)
+                                    .padding(.vertical, 8)
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.large)
+                        }
+
+                        Button(action: { reminderEngine.showFullscreenBreakCountdownIfResting() }) {
+                            HStack(spacing: 8) {
+                                Image(systemName: "arrow.up.left.and.arrow.down.right")
+                                Text(tr("进入全屏倒计时", "Open Fullscreen Countdown"))
+                            }
+                            .font(.headline)
+                            .frame(maxWidth: 280)
+                            .padding(.vertical, 8)
+                        }
+                        .buttonStyle(.borderedProminent)
                         .controlSize(.large)
                     }
-
+                } else {
                     Button(action: { reminderEngine.confirmRest() }) {
-                        Text("立即开始休息")
+                        Text(tr("立即开始休息", "Start Break Now"))
                             .font(.headline)
-                            .frame(maxWidth: 200)
+                            .frame(maxWidth: 260)
                             .padding(.vertical, 8)
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(!reminderEngine.canConfirmRest)
                     .controlSize(.large)
                 }
+
+                Spacer(minLength: 16)
             }
-            
-            Spacer()
+            .padding(.horizontal, 24)
+            .padding(.vertical, 20)
+            .frame(maxWidth: 880)
         }
-        .padding()
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
     
     var statusProgress: Double {
@@ -1787,28 +2018,146 @@ struct TimerView: View {
     }
 }
 
+struct RuleEducationView: View {
+    @ObservedObject var reminderEngine: ReminderEngine
+    private let referenceURL = URL(string: "https://www.aoa.org/AOA/Images/Patients/Eye%20Conditions/20-20-20-rule.pdf")!
+
+    private func tr(_ zh: String, _ en: String) -> String {
+        reminderEngine.tr(zh, en)
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack(alignment: .center, spacing: 10) {
+                    FontAwesomeSymbolView(
+                        unicode: "\u{f06e}",
+                        fallbackSystemName: "eye.fill",
+                        size: 24,
+                        color: .accentColor
+                    )
+                    Text("👀")
+                        .font(.system(size: 25))
+                    Text(tr("您知道吗？", "Did You Know?"))
+                        .font(.system(size: 34, weight: .bold, design: .rounded))
+                }
+
+                HStack(spacing: 14) {
+                    statPill(iconUnicode: "\u{f017}", fallback: "clock.fill", title: "20 min")
+                    statPill(iconUnicode: "\u{f06e}", fallback: "eye.fill", title: "20 sec")
+                    statPill(iconUnicode: "\u{f279}", fallback: "ruler.fill", title: "20 ft / 6 m")
+                }
+
+                ruleTextCard(
+                    body: "20-20-20 法则旨在减少数字眼睛疲劳（计算机视觉综合征）和长时间使用屏幕导致的疲劳。它建议每 20 分钟，您眺望大于等于 20 英尺（6m）外的物体超过 20 秒。这个动作可以让眼睛的聚焦肌肉放松[1]。"
+                )
+
+                ruleTextCard(
+                    body: "The 20-20-20 rule is a guideline designed to reduce digital eye strain (Computer Vision Syndrome) and fatigue caused by prolonged screen use. It advises that every 20 minutes, you take a 20-second break to look at something 20 feet away. This action allows the eye's focusing muscles to relax[1]."
+                )
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(tr("参考文献", "References"))
+                        .font(.headline)
+                    HStack(alignment: .top, spacing: 8) {
+                        Text("[1]")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("American Optometric Association (AOA). 20-20-20 Rule.")
+                                .font(.footnote)
+                            Link(
+                                "https://www.aoa.org/AOA/Images/Patients/Eye%20Conditions/20-20-20-rule.pdf",
+                                destination: referenceURL
+                            )
+                            .font(.footnote.weight(.semibold))
+                        }
+                    }
+                }
+                .padding(.top, 6)
+            }
+            .padding(26)
+            .frame(maxWidth: 860, alignment: .leading)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(
+            LinearGradient(
+                colors: [Color.accentColor.opacity(0.07), Color.clear],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        )
+    }
+
+    private func statPill(iconUnicode: String, fallback: String, title: String) -> some View {
+        HStack(spacing: 8) {
+            FontAwesomeSymbolView(
+                unicode: iconUnicode,
+                fallbackSystemName: fallback,
+                size: 14,
+                color: .accentColor
+            )
+            Text(title)
+                .font(.caption.weight(.semibold))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(
+            Capsule()
+                .fill(Color.accentColor.opacity(0.12))
+        )
+    }
+
+    private func ruleTextCard(body: String) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(body)
+                .font(.body)
+                .lineSpacing(6)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color(nsColor: .windowBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.secondary.opacity(0.16), lineWidth: 1)
+        )
+    }
+}
+
 struct ContentView: View {
     @StateObject private var reminderEngine = ReminderEngine.shared
     @State private var selection: SidebarItem? = .timer
 
+    private func tr(_ zh: String, _ en: String) -> String {
+        reminderEngine.tr(zh, en)
+    }
+
     enum SidebarItem: Hashable {
         case timer
         case settings
+        case ruleEducation
     }
 
     var body: some View {
         NavigationSplitView {
             List(selection: $selection) {
                 NavigationLink(value: SidebarItem.timer) {
-                    Label("计时", systemImage: "timer")
+                    Label(tr("计时", "Timer"), systemImage: "timer")
                 }
                 NavigationLink(value: SidebarItem.settings) {
-                    Label("设置", systemImage: "gearshape")
+                    Label(tr("设置", "Settings"), systemImage: "gearshape")
+                }
+                NavigationLink(value: SidebarItem.ruleEducation) {
+                    Label(tr("科普", "20-20-20 Guide"), systemImage: "book.closed")
                 }
             }
             .listStyle(.sidebar)
             .navigationSplitViewColumnWidth(min: 170, ideal: 190, max: 240)
-            .navigationTitle("Reminder")
+            .navigationTitle(tr("Reminder 护眼助手", "Reminder"))
         } detail: {
             Group {
                 switch selection {
@@ -1816,13 +2165,37 @@ struct ContentView: View {
                     TimerView(reminderEngine: reminderEngine)
                 case .settings:
                     SettingsView(reminderEngine: reminderEngine)
+                case .ruleEducation:
+                    RuleEducationView(reminderEngine: reminderEngine)
                 case .none:
-                    Text("请选择一项")
+                    Text(tr("请选择一项", "Please select an item"))
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .navigationSplitViewStyle(.automatic)
+        .alert(
+            tr("开启通知提醒", "Enable Notifications"),
+            isPresented: Binding(
+                get: { reminderEngine.shouldShowNotificationEnableHint },
+                set: { isPresented in
+                    if !isPresented {
+                        reminderEngine.dismissNotificationEnableHint()
+                    }
+                }
+            )
+        ) {
+            Button(tr("我知道了", "Got it")) {
+                reminderEngine.dismissNotificationEnableHint()
+            }
+        } message: {
+            Text(
+                tr(
+                    "为确保按时护眼，请在系统弹窗中允许 Reminder 发送通知。",
+                    "To receive eye-care reminders on time, please allow notifications for Reminder when prompted."
+                )
+            )
+        }
     }
 }
 

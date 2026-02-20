@@ -4,12 +4,13 @@ set -euo pipefail
 
 APP_NAME="Reminder"
 BUNDLE_ID="${BUNDLE_ID:-com.phantasma.Reminder}"
-APP_VERSION="${APP_VERSION:-0.1.1}"
+APP_VERSION="${APP_VERSION:-0.1.2}"
 APP_BUILD="${APP_BUILD:-1}"
 MIN_SYSTEM="${MIN_SYSTEM:-13.0}"
 OUTPUT_DIR="${1:-dist}"
 ICON_SOURCE="${ICON_SOURCE:-assets/icon_source.png}"
 ICON_ICNS="${ICON_ICNS:-assets/AppIcon.icns}"
+FONT_AWESOME="${FONT_AWESOME:-assets/fa-solid-900.ttf}"
 
 swift build -c release >/dev/null
 BIN_DIR="$(swift build -c release --show-bin-path)"
@@ -32,6 +33,9 @@ if [[ ! -f "${ICON_ICNS}" && -f "${ICON_SOURCE}" ]]; then
 fi
 if [[ -f "${ICON_ICNS}" ]]; then
   cp "${ICON_ICNS}" "${APP_DIR}/Contents/Resources/AppIcon.icns"
+fi
+if [[ -f "${FONT_AWESOME}" ]]; then
+  cp "${FONT_AWESOME}" "${APP_DIR}/Contents/Resources/fa-solid-900.ttf"
 fi
 
 cat > "${APP_DIR}/Contents/Info.plist" <<PLIST

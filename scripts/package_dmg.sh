@@ -3,7 +3,7 @@
 set -euo pipefail
 
 APP_NAME="Reminder"
-APP_VERSION="${APP_VERSION:-0.1.1}"
+APP_VERSION="${APP_VERSION:-0.1.2}"
 APP_BUILD="${APP_BUILD:-1}"
 OUTPUT_DIR="${1:-dist}"
 VOLUME_NAME="${VOLUME_NAME:-${APP_NAME}}"
